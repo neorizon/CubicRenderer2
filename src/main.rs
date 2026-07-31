@@ -1,3 +1,4 @@
+mod camera;
 mod cubic;
 mod gallery;
 mod geometry;
@@ -10,10 +11,12 @@ use std::num::NonZeroU32;
 
 use raw_window_handle::HasWindowHandle;
 use winit::application::ApplicationHandler;
-use winit::event::{ElementState, KeyEvent, MouseButton, WindowEvent};
+use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, NamedKey};
 use winit::window::{Window, WindowAttributes, WindowId};
+
+use camera::Camera;
 
 use glutin::config::{Config, ConfigTemplateBuilder, GetGlConfig};
 use glutin::context::{
@@ -34,7 +37,11 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!("  Tab      switch Interactive <-> Gallery");
     println!("  drag     move a control point (Interactive)");
     println!("  E        cycle edge type: fill AA / hairline AA / fill no-AA (Interactive)");
+    println!("  1-6      load a preset (Serpentine/Loop/Cusp/Quadratic/Line/Point) (Interactive)");
     println!("  R        reset the curve (Interactive)");
+    println!("  scroll        zoom, centered on the cursor");
+    println!("  right-drag    pan");
+    println!("  0             reset the view (zoom/pan)");
     println!("  Esc      quit");
     println!();
 
@@ -50,6 +57,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         surface_state: None,
         scene: None,
         cursor: [0.0, 0.0],
+        right_dragging: false,
         exit_state: Ok(()),
     };
     event_loop.run_app(&mut app)?;
@@ -100,6 +108,17 @@ enum Scene {
     Gallery(GalleryScene),
 }
 
+impl Scene {
+    /// Each scene owns an independent `Camera`, so switching scenes (Tab, or
+    /// a gallery click into Interactive) preserves each one's zoom/pan.
+    fn camera_mut(&mut self) -> &mut Camera {
+        match self {
+            Scene::Interactive(s) => &mut s.camera,
+            Scene::Gallery(s) => &mut s.camera,
+        }
+    }
+}
+
 struct Renderer {
     cubic: gl::CubicPipeline,
     solid: gl::SolidPipeline,
@@ -118,6 +137,7 @@ struct App {
     surface_state: Option<SurfaceState>,
     scene: Option<(Scene, Renderer)>,
     cursor: [f32; 2],
+    right_dragging: bool,
     exit_state: Result<(), Box<dyn Error>>,
 }
 
@@ -207,17 +227,36 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::CursorMoved { position, .. } => {
-                self.cursor = [position.x as f32, position.y as f32];
+                let new_cursor = [position.x as f32, position.y as f32];
+                if self.right_dragging {
+                    let delta = [new_cursor[0] - self.cursor[0], new_cursor[1] - self.cursor[1]];
+                    if let Some((scene, _)) = self.scene.as_mut() {
+                        scene.camera_mut().pan_by(delta);
+                    }
+                }
+                self.cursor = new_cursor;
                 if let Some((Scene::Interactive(scene), _)) = self.scene.as_mut() {
                     scene.on_mouse_move(self.cursor);
                 }
             }
-            WindowEvent::MouseInput { state, button: MouseButton::Left, .. } => {
+            WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Left, .. } => {
+                self.handle_left_click();
+            }
+            WindowEvent::MouseInput { state: ElementState::Released, button: MouseButton::Left, .. } => {
                 if let Some((Scene::Interactive(scene), _)) = self.scene.as_mut() {
-                    match state {
-                        ElementState::Pressed => scene.on_mouse_down(self.cursor),
-                        ElementState::Released => scene.on_mouse_up(),
-                    }
+                    scene.on_mouse_up();
+                }
+            }
+            WindowEvent::MouseInput { state, button: MouseButton::Right, .. } => {
+                self.right_dragging = state == ElementState::Pressed;
+            }
+            WindowEvent::MouseWheel { delta, .. } => {
+                let factor = match delta {
+                    MouseScrollDelta::LineDelta(_, y) => 1.1f32.powf(y),
+                    MouseScrollDelta::PixelDelta(pos) => 1.1f32.powf(pos.y as f32 / 40.0),
+                };
+                if let Some((scene, _)) = self.scene.as_mut() {
+                    scene.camera_mut().zoom_at(self.cursor, factor);
                 }
             }
             WindowEvent::KeyboardInput {
@@ -263,6 +302,18 @@ impl App {
                         scene.reset(viewport);
                     }
                 }
+                "1" | "2" | "3" | "4" | "5" | "6" => {
+                    let viewport = self.viewport_size();
+                    let index = s.parse::<usize>().unwrap() - 1;
+                    if let Some((Scene::Interactive(scene), _)) = self.scene.as_mut() {
+                        scene.load_preset(index, viewport);
+                    }
+                }
+                "0" => {
+                    if let Some((scene, _)) = self.scene.as_mut() {
+                        scene.camera_mut().reset();
+                    }
+                }
                 _ => {}
             },
             _ => {}
@@ -276,6 +327,27 @@ impl App {
                 Scene::Interactive(_) => Scene::Gallery(GalleryScene::new()),
                 Scene::Gallery(_) => Scene::Interactive(InteractiveScene::new(viewport)),
             };
+        }
+    }
+
+    /// In Interactive mode, starts a drag. In Gallery mode, a click on a
+    /// cell jumps into Interactive mode loaded with that exact curve
+    /// (rescaled to fill the interactive viewport, same as a preset key).
+    fn handle_left_click(&mut self) {
+        let cursor = self.cursor;
+        let viewport = self.viewport_size();
+        match self.scene.as_mut() {
+            Some((Scene::Interactive(scene), _)) => scene.on_mouse_down(cursor),
+            Some((Scene::Gallery(gallery), _)) => {
+                if let Some(index) = gallery.cell_at(cursor, viewport) {
+                    let mut interactive = InteractiveScene::new(viewport);
+                    interactive.load_preset(index, viewport);
+                    if let Some((scene, _)) = self.scene.as_mut() {
+                        *scene = Scene::Interactive(interactive);
+                    }
+                }
+            }
+            None => {}
         }
     }
 

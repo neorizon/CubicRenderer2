@@ -4,6 +4,8 @@
 
 use glow::HasContext;
 
+use crate::camera::Camera;
+
 unsafe fn compile_shader(gl: &glow::Context, kind: u32, src: &str) -> glow::NativeShader {
     unsafe {
         let shader = gl.create_shader(kind).expect("create_shader failed");
@@ -73,6 +75,8 @@ pub struct CubicVertex {
 pub struct CubicPipeline {
     program: glow::NativeProgram,
     u_viewport: glow::UniformLocation,
+    u_pan: glow::UniformLocation,
+    u_zoom: glow::UniformLocation,
     u_color: glow::UniformLocation,
     u_edge_type: glow::UniformLocation,
     vao: glow::VertexArray,
@@ -89,6 +93,8 @@ impl CubicPipeline {
                 include_str!("shaders/cubic.frag"),
             );
             let u_viewport = gl.get_uniform_location(program, "u_viewportSize").unwrap();
+            let u_pan = gl.get_uniform_location(program, "u_pan").unwrap();
+            let u_zoom = gl.get_uniform_location(program, "u_zoom").unwrap();
             let u_color = gl.get_uniform_location(program, "u_color").unwrap();
             let u_edge_type = gl.get_uniform_location(program, "u_edgeType").unwrap();
 
@@ -105,18 +111,21 @@ impl CubicPipeline {
             gl.bind_buffer(glow::ELEMENT_ARRAY_BUFFER, Some(ebo));
             gl.bind_vertex_array(None);
 
-            CubicPipeline { program, u_viewport, u_color, u_edge_type, vao, vbo, ebo }
+            CubicPipeline { program, u_viewport, u_pan, u_zoom, u_color, u_edge_type, vao, vbo, ebo }
         }
     }
 
     /// Draws a fan of `verts` (already triangulated as a convex polygon,
     /// vertex 0 shared by every triangle) covering the region the caller
     /// wants shaded; each vertex carries its own exact K,L,M value.
+    /// `camera` is applied on the GPU: `verts` stay in world space (KLM is
+    /// evaluated there), only the final screen position moves.
     #[allow(clippy::too_many_arguments)]
     pub fn draw_fan(
         &self,
         gl: &glow::Context,
         viewport: [f32; 2],
+        camera: &Camera,
         verts: &[CubicVertex],
         color: [f32; 4],
         edge_type: EdgeType,
@@ -131,6 +140,8 @@ impl CubicPipeline {
         unsafe {
             gl.use_program(Some(self.program));
             gl.uniform_2_f32(Some(&self.u_viewport), viewport[0], viewport[1]);
+            gl.uniform_2_f32(Some(&self.u_pan), camera.pan[0], camera.pan[1]);
+            gl.uniform_1_f32(Some(&self.u_zoom), camera.zoom);
             gl.uniform_4_f32(Some(&self.u_color), color[0], color[1], color[2], color[3]);
             gl.uniform_1_i32(Some(&self.u_edge_type), edge_type as i32);
 
@@ -149,6 +160,8 @@ impl CubicPipeline {
 pub struct SolidPipeline {
     program: glow::NativeProgram,
     u_viewport: glow::UniformLocation,
+    u_pan: glow::UniformLocation,
+    u_zoom: glow::UniformLocation,
     u_color: glow::UniformLocation,
     vao: glow::VertexArray,
     vbo: glow::Buffer,
@@ -163,6 +176,8 @@ impl SolidPipeline {
                 include_str!("shaders/solid.frag"),
             );
             let u_viewport = gl.get_uniform_location(program, "u_viewportSize").unwrap();
+            let u_pan = gl.get_uniform_location(program, "u_pan").unwrap();
+            let u_zoom = gl.get_uniform_location(program, "u_zoom").unwrap();
             let u_color = gl.get_uniform_location(program, "u_color").unwrap();
 
             let vao = gl.create_vertex_array().unwrap();
@@ -173,14 +188,16 @@ impl SolidPipeline {
             gl.vertex_attrib_pointer_f32(0, 2, glow::FLOAT, false, 8, 0);
             gl.bind_vertex_array(None);
 
-            SolidPipeline { program, u_viewport, u_color, vao, vbo }
+            SolidPipeline { program, u_viewport, u_pan, u_zoom, u_color, vao, vbo }
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn draw(
         &self,
         gl: &glow::Context,
         viewport: [f32; 2],
+        camera: &Camera,
         mode: u32,
         points: &[[f32; 2]],
         color: [f32; 4],
@@ -191,6 +208,8 @@ impl SolidPipeline {
         unsafe {
             gl.use_program(Some(self.program));
             gl.uniform_2_f32(Some(&self.u_viewport), viewport[0], viewport[1]);
+            gl.uniform_2_f32(Some(&self.u_pan), camera.pan[0], camera.pan[1]);
+            gl.uniform_1_f32(Some(&self.u_zoom), camera.zoom);
             gl.uniform_4_f32(Some(&self.u_color), color[0], color[1], color[2], color[3]);
 
             gl.bind_vertex_array(Some(self.vao));

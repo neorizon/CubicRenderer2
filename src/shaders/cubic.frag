@@ -35,7 +35,20 @@ void main() {
         float gradMag = length(vec2(dfdx, dfdy));
 
         float f = (u_edgeType == 1) ? abs(func) : func;
-        float dist = f / max(gradMag, 1e-6);
+        // gradMag is the true, mathematically exact |grad f|, which is
+        // ~1px worth of change in f -- not an arbitrary quantity that needs
+        // clamping to some fixed scale. It legitimately gets very small
+        // (verified: ~1e-8, not float noise) for some curves, because the
+        // affine k, l, m end up with small linear coefficients for that
+        // curve's specific geometry -- nothing to do with being close to a
+        // cusp or Loop node specifically. A clamp of 1e-6 was previously
+        // used here to guard the single true zero (an exact cusp/node
+        // singularity, one pixel), but 1e-6 is itself large enough to
+        // misfire on those legitimately-small-but-correct gradients,
+        // inflating the ~1px AA falloff into a many-pixel-wide gradient
+        // band across the whole curve. 1e-12 only guards the literal 0/0
+        // case; it's far below any gradient magnitude a real curve produces.
+        float dist = f / max(gradMag, 1e-12);
 
         if (u_edgeType == 1) {
             coverage = max(1.0 - dist, 0.0);
