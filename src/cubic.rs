@@ -508,6 +508,120 @@ pub fn chop_at_loop_intersection(p: &[Pt; 4]) -> Vec<CubicPiece> {
         .collect()
 }
 
+/// Radius, in *screen* pixels, of the region around an acnode that the
+/// coverage shader discards. The acnode is a single point mathematically,
+/// but the shader's AA distance estimate `f / |grad f|` degenerates around
+/// it (both f and grad f vanish there, and their ratio stays below 1 for
+/// several pixels), which is what paints it as a visible blob rather than a
+/// lone pixel. This is sized to cover that blob -- see
+/// `stray_shaded_pixels_all_lie_within_the_acnode_halo`.
+pub const ACNODE_HALO_PX: f32 = 6.0;
+
+/// Fraction of the acnode's clearance from the arc that its halo may
+/// occupy, so the discarded disc never reaches the curve itself.
+const ACNODE_HALO_ARC_MARGIN_PX: f32 = 1.0;
+
+/// The isolated real singular point ("acnode") of a serpentine's implicit
+/// cubic: a point where `k^3 - l*m` and its gradient both vanish, but which
+/// is *not* on the Bezier arc.
+///
+/// Every rational cubic has exactly one double point, and which kind it is
+/// *is* the Loop-Blinn classification: a Loop's is a crunode (the visible
+/// self-intersection, which `chop_at_loop_intersection` splits at), a Cusp's
+/// sits right on the curve, and a Serpentine's is an acnode -- real, but
+/// isolated and detached from the arc. The acnode still satisfies the
+/// implicit test the coverage shader applies, so it lights up as a stray dot
+/// floating inside the coverage mesh, drifting towards the arc as the curve
+/// approaches a cusp and disappearing into the node once it becomes a Loop.
+#[derive(Clone, Copy, Debug)]
+pub struct Acnode {
+    pub point: Pt,
+    /// Distance from `point` to the nearest point of the Bezier arc, in
+    /// world units.
+    pub dist_to_arc: f32,
+}
+
+impl Acnode {
+    /// Radius of the disc the shader discards, in screen pixels, or 0 when
+    /// no halo should be applied.
+    ///
+    /// It is all-or-nothing on purpose. As the curve approaches a cusp the
+    /// acnode migrates onto the arc, and once there is not enough clearance
+    /// for the full disc the right answer is to leave the region alone: a
+    /// partial disc would punch a hole through the middle of the blob and
+    /// could strand its far rim as a *new* detached crescent, and by that
+    /// point the dot has fused with the cusp tip and no longer reads as a
+    /// stray mark anyway.
+    pub fn halo_radius_px(&self, zoom: f32) -> f32 {
+        if self.dist_to_arc * zoom > ACNODE_HALO_PX + ACNODE_HALO_ARC_MARGIN_PX {
+            ACNODE_HALO_PX
+        } else {
+            0.0
+        }
+    }
+}
+
+/// Locates the acnode of `p`'s implicit cubic, if it has one.
+///
+/// `chop_at_loop_intersection` finds a Loop's double point as the two real
+/// roots `(d1 +/- sqrt(4*d0*d2 - 3*d1^2)) / (2*d0)` of the same quadratic.
+/// For a serpentine that radicand is negative, so the double point is
+/// reached at a *complex conjugate* pair of parameters instead. Evaluating
+/// the Bezier there is still well defined, and because the pair is
+/// conjugate the two images are conjugates of each other -- and they are by
+/// definition the same double point, so that point is real and the
+/// imaginary parts cancel exactly. Hence: evaluate the Bernstein basis in
+/// complex arithmetic and keep the real part.
+pub fn acnode(p: &[Pt; 4]) -> Option<Acnode> {
+    let d = inflection_coeffs(p);
+    if !matches!(classify(p, d), CubicKind::Serpentine | CubicKind::Cusp) {
+        return None;
+    }
+    // d0 == 0 is the exact-cusp case: the double point degenerates onto the
+    // curve and the parameter below runs off to infinity.
+    if d[0].abs() <= NEARLY_ZERO {
+        return None;
+    }
+    let radicand = 3.0 * d[1] * d[1] - 4.0 * d[0] * d[2];
+    if radicand <= 0.0 {
+        return None; // real roots -> crunode, not an acnode
+    }
+
+    let inv = 1.0 / (2.0 * d[0]);
+    let (tr, ti) = (d[1] * inv, radicand.sqrt() * inv);
+
+    let mul = |a: (f32, f32), b: (f32, f32)| (a.0 * b.0 - a.1 * b.1, a.0 * b.1 + a.1 * b.0);
+    let t = (tr, ti);
+    let mt = (1.0 - tr, -ti);
+    let t2 = mul(t, t);
+    let mt2 = mul(mt, mt);
+    // Real parts of the four Bernstein weights; the control points are real,
+    // so only these are needed.
+    let w = [
+        mul(mt2, mt).0,
+        3.0 * mul(mt2, t).0,
+        3.0 * mul(mt, t2).0,
+        mul(t2, t).0,
+    ];
+    let point = [
+        w[0] * p[0][0] + w[1] * p[1][0] + w[2] * p[2][0] + w[3] * p[3][0],
+        w[0] * p[0][1] + w[1] * p[1][1] + w[2] * p[2][1] + w[3] * p[3][1],
+    ];
+    if !point[0].is_finite() || !point[1].is_finite() {
+        return None;
+    }
+
+    const ARC_SAMPLES: usize = 256;
+    let dist_to_arc = (0..=ARC_SAMPLES)
+        .map(|i| {
+            let e = eval(p, i as f32 / ARC_SAMPLES as f32);
+            ((e[0] - point[0]).powi(2) + (e[1] - point[1]).powi(2)).sqrt()
+        })
+        .fold(f32::INFINITY, f32::min);
+
+    Some(Acnode { point, dist_to_arc })
+}
+
 /// Reference control points hitting each of the six classifications, plus
 /// four curves that are all classified `Loop` but exercise every distinct
 /// branch of `chop_at_loop_intersection`'s chop-count/sign logic (numerically
@@ -604,6 +718,227 @@ pub fn preset_curves() -> [(&'static str, CubicKind, [Pt; 4]); 23] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The `func`/`gradMag` pair `shaders/cubic.frag` computes per fragment,
+    /// mirrored on the CPU so the coverage a pixel *would* get is testable
+    /// without a GL context. K, L, M are affine, so their gradients are just
+    /// their own x/y coefficients (this is exactly what `dFdx`/`dFdy` of the
+    /// interpolated klm recover on the GPU).
+    fn shader_coverage(c: &ImplicitCubic, q: Pt) -> f32 {
+        let [k, l, m] = c.eval_klm(q);
+        let func = k * k * k - l * m;
+        let gx = 3.0 * k * k * c.k[0] - l * c.m[0] - m * c.l[0];
+        let gy = 3.0 * k * k * c.k[1] - l * c.m[1] - m * c.l[1];
+        let grad_mag = (gx * gx + gy * gy).sqrt();
+        // Hairline AA: the edge type the artifact was reported against.
+        1.0 - func.abs() / grad_mag.max(1e-12)
+    }
+
+    fn point_in_convex_polygon(pt: Pt, poly: &[Pt]) -> bool {
+        let mut sign = 0i32;
+        for i in 0..poly.len() {
+            let a = poly[i];
+            let b = poly[(i + 1) % poly.len()];
+            let cross = (b[0] - a[0]) * (pt[1] - a[1]) - (b[1] - a[1]) * (pt[0] - a[0]);
+            let s = if cross > 0.0 {
+                1
+            } else if cross < 0.0 {
+                -1
+            } else {
+                0
+            };
+            if s != 0 {
+                if sign == 0 {
+                    sign = s;
+                } else if s != sign {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    /// A serpentine's implicit cubic has an acnode: a real, isolated
+    /// solution of k^3 - l*m = 0 that lies *off* the Bezier arc. It is a
+    /// genuine singular point, so both the implicit function and its
+    /// gradient vanish there.
+    #[test]
+    fn acnode_is_a_singular_point_of_the_implicit_cubic() {
+        let mut checked = 0;
+        for (name, _, p) in preset_curves() {
+            let Some(ac) = acnode(&p) else { continue };
+            let c = compute_implicit(&p);
+            let [k, l, m] = c.eval_klm(ac.point);
+            let f = k * k * k - l * m;
+            let gx = 3.0 * k * k * c.k[0] - l * c.m[0] - m * c.l[0];
+            let gy = 3.0 * k * k * c.k[1] - l * c.m[1] - m * c.l[1];
+            // Scale-free: compare against the gradient magnitude a whole
+            // pixel away from the curve, i.e. the shader's own unit.
+            let scale = c.k.iter().chain(c.l.iter()).chain(c.m.iter()).fold(0.0f32, |a, v| a.max(v.abs()));
+            assert!(
+                f.abs() / scale.powi(3) < 1e-6,
+                "{name}: f = {f} at the acnode {:?} (should vanish)",
+                ac.point
+            );
+            assert!(
+                (gx * gx + gy * gy).sqrt() / (scale * scale) < 1e-6,
+                "{name}: grad = ({gx}, {gy}) at the acnode (should vanish)"
+            );
+            checked += 1;
+        }
+        assert!(checked >= 4, "expected several serpentine presets to have an acnode, got {checked}");
+    }
+
+    #[test]
+    fn only_serpentines_have_an_acnode() {
+        for (name, _, p) in preset_curves() {
+            let kind = compute_implicit(&p).kind;
+            if matches!(kind, CubicKind::Loop | CubicKind::Line | CubicKind::Point) {
+                assert!(acnode(&p).is_none(), "{name} ({kind:?}) should have no acnode");
+            }
+        }
+    }
+
+    /// The regression test for the floating blue dot.
+    ///
+    /// The defect is not "a pixel far from the arc" -- the implicit curve
+    /// legitimately continues past the arc's endpoints inside the padded
+    /// hull. It is specifically a *detached* mark: a shaded blob with a gap
+    /// of empty pixels between it and the stroke. So this rasterizes the
+    /// coverage mesh at one sample per pixel, applies the acnode halo the
+    /// shader will apply, and flood-fills the shaded pixels starting from
+    /// the arc. Anything left unreached is a floating artifact.
+    #[test]
+    fn no_shaded_pixels_are_detached_from_the_curve() {
+        let a: [Pt; 4] = [[40.0, 260.0], [460.0, 40.0], [160.0, 40.0], [460.0, 260.0]];
+        let b: [Pt; 4] = [[40.0, 260.0], [460.0, 40.0], [-80.0, 40.0], [460.0, 260.0]];
+
+        for step in 0..=20 {
+            let u = step as f32 / 20.0;
+            let mut p = a;
+            p[2] = [a[2][0] + (b[2][0] - a[2][0]) * u, a[2][1] + (b[2][1] - a[2][1]) * u];
+
+            for piece in chop_at_loop_intersection(&p) {
+                if !piece.implicit.is_renderable() {
+                    continue;
+                }
+                let mesh = crate::geometry::coverage_mesh(&piece.points, &piece.implicit, 1.5);
+                let poly: Vec<Pt> = mesh.iter().map(|v| v.pos).collect();
+                if poly.len() < 3 {
+                    continue;
+                }
+                let ac = acnode(&piece.points);
+                let halo = ac.map_or(0.0, |ac| ac.halo_radius_px(1.0)); // zoom 1: world px == screen px
+
+                let (mut mnx, mut mny, mut mxx, mut mxy) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+                for q in poly.iter() {
+                    mnx = mnx.min(q[0]);
+                    mny = mny.min(q[1]);
+                    mxx = mxx.max(q[0]);
+                    mxy = mxy.max(q[1]);
+                }
+                let (w, h) = ((mxx - mnx).ceil() as usize + 2, (mxy - mny).ceil() as usize + 2);
+                let at = |i: usize, j: usize| [mnx + i as f32, mny + j as f32];
+
+                let mut shaded = vec![false; w * h];
+                for j in 0..h {
+                    for i in 0..w {
+                        let q = at(i, j);
+                        if !point_in_convex_polygon(q, &poly) {
+                            continue;
+                        }
+                        if shader_coverage(&piece.implicit, q) <= 0.0 {
+                            continue;
+                        }
+                        if let Some(ac) = ac {
+                            let d = ((q[0] - ac.point[0]).powi(2) + (q[1] - ac.point[1]).powi(2)).sqrt();
+                            if halo > 0.0 && d <= halo {
+                                continue; // the shader discards this fragment
+                            }
+                        }
+                        shaded[j * w + i] = true;
+                    }
+                }
+
+                // Seed the flood fill from the shaded pixels the arc passes
+                // through (3x3 around each sample, so a sample landing between
+                // pixel centres still seeds), then spread 8-connected.
+                let mut seen = vec![false; w * h];
+                let mut stack: Vec<(usize, usize)> = Vec::new();
+                for s in 0..=4000 {
+                    let e = eval(&piece.points, s as f32 / 4000.0);
+                    let (ci, cj) = ((e[0] - mnx).round() as i32, (e[1] - mny).round() as i32);
+                    for dj in -1i32..=1 {
+                        for di in -1i32..=1 {
+                            let (i, j) = (ci + di, cj + dj);
+                            if i < 0 || j < 0 || i >= w as i32 || j >= h as i32 {
+                                continue;
+                            }
+                            let (i, j) = (i as usize, j as usize);
+                            if shaded[j * w + i] && !seen[j * w + i] {
+                                seen[j * w + i] = true;
+                                stack.push((i, j));
+                            }
+                        }
+                    }
+                }
+                while let Some((i, j)) = stack.pop() {
+                    for dj in -1i32..=1 {
+                        for di in -1i32..=1 {
+                            let (ni, nj) = (i as i32 + di, j as i32 + dj);
+                            if ni < 0 || nj < 0 || ni >= w as i32 || nj >= h as i32 {
+                                continue;
+                            }
+                            let (ni, nj) = (ni as usize, nj as usize);
+                            if shaded[nj * w + ni] && !seen[nj * w + ni] {
+                                seen[nj * w + ni] = true;
+                                stack.push((ni, nj));
+                            }
+                        }
+                    }
+                }
+
+                let orphans: Vec<Pt> = (0..w * h)
+                    .filter(|&n| shaded[n] && !seen[n])
+                    .map(|n| at(n % w, n / w))
+                    .collect();
+                assert!(
+                    orphans.is_empty(),
+                    "u={u:.2} ({:?}): {} shaded pixel(s) detached from the curve, e.g. {:?} \
+                     (acnode = {:?}, halo = {halo}px)",
+                    piece.implicit.kind,
+                    orphans.len(),
+                    &orphans[..orphans.len().min(4)],
+                    ac.map(|a| (a.point, a.dist_to_arc)),
+                );
+            }
+        }
+    }
+
+    /// Discarding the halo must never eat into the curve itself: with the
+    /// halo active, no pixel within half a pixel of the true arc is inside
+    /// it.
+    #[test]
+    fn the_acnode_halo_never_covers_the_curve() {
+        for (name, _, p) in preset_curves() {
+            let Some(ac) = acnode(&p) else { continue };
+            for zoom in [0.25f32, 1.0, 4.0] {
+                let radius = ac.halo_radius_px(zoom);
+                if radius <= 0.0 {
+                    continue;
+                }
+                for i in 0..=2000 {
+                    let q = eval(&p, i as f32 / 2000.0);
+                    let d = ((q[0] - ac.point[0]).powi(2) + (q[1] - ac.point[1]).powi(2)).sqrt() * zoom;
+                    assert!(
+                        d > radius,
+                        "{name} @zoom {zoom}: curve point {q:?} is {d}px from the acnode, \
+                         inside the {radius}px halo"
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn presets_classify_as_labeled() {
@@ -878,3 +1213,7 @@ mod tests {
         super::eval(p, t)
     }
 }
+
+
+
+

@@ -11,13 +11,28 @@ precision highp float;
 // (dFdx/dFdy of the *inputs*, not of the composite f) -- exactly as Skia's
 // shader does it. dFdx/dFdy are core in GLSL ES 3.00.
 in vec3 v_klm;
+in vec2 v_screen;
 out vec4 fragColor;
 
 uniform vec4 u_color;
 // 0 = fill, antialiased | 1 = hairline stroke, antialiased | 2 = fill, no AA
 uniform int u_edgeType;
 
+// Screen-space centre and radius of the acnode halo; radius 0 disables it.
+//
+// A serpentine's implicit cubic k^3 - l*m = 0 has an *acnode*: an isolated
+// real solution that is not on the Bezier arc at all (it is the image of a
+// complex-conjugate parameter pair). It satisfies the test below and falls
+// inside the coverage mesh's convex hull, so it renders as a floating dot.
+// The CPU solves for it in closed form; see `cubic::Acnode`.
+uniform vec2 u_acnode;
+uniform float u_acnodeRadius;
+
 void main() {
+    if (u_acnodeRadius > 0.0 && distance(v_screen, u_acnode) < u_acnodeRadius) {
+        discard;
+    }
+
     float k = v_klm.x;
     float l = v_klm.y;
     float m = v_klm.z;

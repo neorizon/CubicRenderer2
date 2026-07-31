@@ -79,6 +79,8 @@ pub struct CubicPipeline {
     u_zoom: glow::UniformLocation,
     u_color: glow::UniformLocation,
     u_edge_type: glow::UniformLocation,
+    u_acnode: glow::UniformLocation,
+    u_acnode_radius: glow::UniformLocation,
     vao: glow::VertexArray,
     vbo: glow::Buffer,
     ebo: glow::Buffer,
@@ -97,6 +99,8 @@ impl CubicPipeline {
             let u_zoom = gl.get_uniform_location(program, "u_zoom").unwrap();
             let u_color = gl.get_uniform_location(program, "u_color").unwrap();
             let u_edge_type = gl.get_uniform_location(program, "u_edgeType").unwrap();
+            let u_acnode = gl.get_uniform_location(program, "u_acnode").unwrap();
+            let u_acnode_radius = gl.get_uniform_location(program, "u_acnodeRadius").unwrap();
 
             let vao = gl.create_vertex_array().unwrap();
             let vbo = gl.create_buffer().unwrap();
@@ -111,7 +115,19 @@ impl CubicPipeline {
             gl.bind_buffer(glow::ELEMENT_ARRAY_BUFFER, Some(ebo));
             gl.bind_vertex_array(None);
 
-            CubicPipeline { program, u_viewport, u_pan, u_zoom, u_color, u_edge_type, vao, vbo, ebo }
+            CubicPipeline {
+                program,
+                u_viewport,
+                u_pan,
+                u_zoom,
+                u_color,
+                u_edge_type,
+                u_acnode,
+                u_acnode_radius,
+                vao,
+                vbo,
+                ebo,
+            }
         }
     }
 
@@ -120,6 +136,8 @@ impl CubicPipeline {
     /// wants shaded; each vertex carries its own exact K,L,M value.
     /// `camera` is applied on the GPU: `verts` stay in world space (KLM is
     /// evaluated there), only the final screen position moves.
+    /// `acnode`, when present, marks a stray isolated solution of the implicit
+    /// equation that the shader must not paint; see `cubic::Acnode`.
     #[allow(clippy::too_many_arguments)]
     pub fn draw_fan(
         &self,
@@ -129,6 +147,7 @@ impl CubicPipeline {
         verts: &[CubicVertex],
         color: [f32; 4],
         edge_type: EdgeType,
+        acnode: Option<crate::cubic::Acnode>,
     ) {
         if verts.len() < 3 {
             return;
@@ -144,6 +163,20 @@ impl CubicPipeline {
             gl.uniform_1_f32(Some(&self.u_zoom), camera.zoom);
             gl.uniform_4_f32(Some(&self.u_color), color[0], color[1], color[2], color[3]);
             gl.uniform_1_i32(Some(&self.u_edge_type), edge_type as i32);
+            // Same transform the vertex shader applies, so v_screen and
+            // u_acnode land in the same space.
+            let (ac_pos, ac_radius) = match acnode {
+                Some(ac) => (
+                    [
+                        (ac.point[0] + camera.pan[0]) * camera.zoom,
+                        (ac.point[1] + camera.pan[1]) * camera.zoom,
+                    ],
+                    ac.halo_radius_px(camera.zoom),
+                ),
+                None => ([0.0, 0.0], 0.0),
+            };
+            gl.uniform_2_f32(Some(&self.u_acnode), ac_pos[0], ac_pos[1]);
+            gl.uniform_1_f32(Some(&self.u_acnode_radius), ac_radius);
 
             gl.bind_vertex_array(Some(self.vao));
             gl.bind_buffer(glow::ARRAY_BUFFER, Some(self.vbo));

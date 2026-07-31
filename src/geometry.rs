@@ -46,6 +46,12 @@ const COVERAGE_SAMPLES: usize = 16;
 /// That's an inherent conflict between AA margin and branch exclusion at
 /// sub-pixel distances, not something this function can geometry its way
 /// out of.
+///
+/// A *serpentine* has one stray branch this hull can never exclude: the
+/// acnode, an isolated real solution of `k^3 - l*m = 0` that lies well
+/// inside the control polygon and so is always admitted. It is handled
+/// downstream instead, by the shader discarding a disc around it -- see
+/// [`crate::cubic::Acnode`].
 pub fn coverage_mesh(points: &[Pt; 4], implicit: &ImplicitCubic, pad: f32) -> Vec<CubicVertex> {
     let mut hull_points: Vec<Pt> =
         (0..=COVERAGE_SAMPLES).map(|i| cubic::eval(points, i as f32 / COVERAGE_SAMPLES as f32)).collect();

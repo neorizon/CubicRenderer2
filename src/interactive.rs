@@ -98,13 +98,14 @@ impl InteractiveScene {
                 continue;
             }
             let quad = geometry::coverage_mesh(&piece.points, &piece.implicit, 1.5);
+            let acnode = cubic::acnode(&piece.points);
             let [r, g, b] = piece.implicit.kind.accent_color();
             // A faint fill wash shows the implicit region even when the
             // primary edge type is a thin hairline.
             if self.edge_type != EdgeType::FillAA {
-                cubic_pipe.draw_fan(gl, viewport, &self.camera, &quad, [r, g, b, 0.15], EdgeType::FillAA);
+                cubic_pipe.draw_fan(gl, viewport, &self.camera, &quad, [r, g, b, 0.15], EdgeType::FillAA, acnode);
             }
-            cubic_pipe.draw_fan(gl, viewport, &self.camera, &quad, [r, g, b, 0.95], self.edge_type);
+            cubic_pipe.draw_fan(gl, viewport, &self.camera, &quad, [r, g, b, 0.95], self.edge_type, acnode);
         }
 
         for edge in self.points.windows(2) {

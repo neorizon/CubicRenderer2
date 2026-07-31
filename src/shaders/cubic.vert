@@ -13,6 +13,9 @@ uniform vec2 u_pan;
 uniform float u_zoom;
 
 out vec3 v_klm;
+// Screen-space position (y-down, matching the app's convention). Passed as a
+// varying rather than read from gl_FragCoord because gl_FragCoord is y-up.
+out vec2 v_screen;
 
 void main() {
     vec2 screen = (a_pos + u_pan) * u_zoom;
@@ -20,4 +23,5 @@ void main() {
     ndc.y = -ndc.y;
     gl_Position = vec4(ndc, 0.0, 1.0);
     v_klm = a_klm;
+    v_screen = screen;
 }

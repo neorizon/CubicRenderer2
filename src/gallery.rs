@@ -82,8 +82,9 @@ impl GalleryScene {
                     continue;
                 }
                 let quad = geometry::coverage_mesh(&piece.points, &piece.implicit, 1.5);
-                cubic_pipe.draw_fan(gl, viewport, &self.camera, &quad, [r, g, b, 0.15], EdgeType::FillAA);
-                cubic_pipe.draw_fan(gl, viewport, &self.camera, &quad, [r, g, b, 0.95], EdgeType::HairlineAA);
+                let acnode = cubic::acnode(&piece.points);
+                cubic_pipe.draw_fan(gl, viewport, &self.camera, &quad, [r, g, b, 0.15], EdgeType::FillAA, acnode);
+                cubic_pipe.draw_fan(gl, viewport, &self.camera, &quad, [r, g, b, 0.95], EdgeType::HairlineAA, acnode);
             }
 
             for edge in points.windows(2) {
