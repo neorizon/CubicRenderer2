@@ -445,6 +445,32 @@ pub fn chop_at_loop_intersection(p: &[Pt; 4]) -> Vec<CubicPiece> {
         return vec![CubicPiece { points: *p, implicit: compute_implicit(p) }];
     }
 
+    // Canonicalize the traversal direction before doing any of the loop
+    // math, because none of that math is reversal-invariant on its own.
+    //
+    // d0 is exactly negated by t -> 1-t, and `set_loop_klm` keys its
+    // orientation normalization off `d[0]`'s sign *combined* with the sign
+    // of k[1] -- which does not flip in lockstep. The upshot is that the
+    // raw implicit f comes out negated under reversal for most curves but
+    // identical for others, so no sign derived from d0 can make the fill
+    // direction-independent. Measured across the Loop presets: reversal
+    // negates f for six of them and leaves it alone for two.
+    //
+    // Rather than chase that with a correction factor, run the whole
+    // derivation on one fixed orientation (d0 > 0) and map the pieces back
+    // to the caller's direction. Reversal invariance then holds by
+    // construction instead of by tuning. See
+    // `loop_fill_is_invariant_under_reversal`.
+    if d[0] < 0.0 {
+        let mut pieces = chop_at_loop_intersection(&[p[3], p[2], p[1], p[0]]);
+        pieces.reverse();
+        for piece in pieces.iter_mut() {
+            let q = piece.points;
+            piece.points = [q[3], q[2], q[1], q[0]];
+        }
+        return pieces;
+    }
+
     let root = (4.0 * d[0] * d[2] - 3.0 * d[1] * d[1]).max(0.0).sqrt();
     let ls = (d[1] - root) / (2.0 * d[0]);
     let ms = (d[1] + root) / (2.0 * d[0]);
@@ -458,31 +484,40 @@ pub fn chop_at_loop_intersection(p: &[Pt; 4]) -> Vec<CubicPiece> {
         chop_ts.push(large_s);
     }
 
-    // Which piece(s) are "the loop" (the closed middle section between the
-    // two self-intersection parameters) versus a tail -- the loop formula's
-    // K,L need negating on the loop side relative to the tails.
+    // Crossing a double point always swaps which side of the arc the
+    // negative region lies on -- near a crunode f = k^3 - l*m is a saddle,
+    // so {f < 0} occupies two *opposite* quadrants of the crossing. The
+    // loop piece's K,L therefore always need negating relative to the
+    // tails, by a fixed -1.
     //
-    // Skia's GrPathUtils::chopCubicAtLoopIntersection hardcodes this flip to
-    // a constant -1 (klm_rev = {1,-1,1}), because Skia only ever consumes it
-    // through a stencil/cover pipeline that combines this klm-tested sliver
-    // with separate plain-filled interior triangles -- the *sign* only has
-    // to be internally consistent for that stencil accounting, never
-    // correct in isolation. We draw each chopped piece as its own
-    // standalone alpha-blended mesh (no stencil compositing), so the loop
-    // piece's sign must independently match its own true enclosed interior.
-    // Verified numerically (see `loop_piece_fill_matches_true_interior`
-    // below) that the correct standalone sign is `d[0].signum()`, not a
-    // fixed -1: Skia's constant happens to agree only when d[0] < 0, and is
-    // inverted (paints the loop's exterior instead of its interior) when
-    // d[0] > 0.
-    let rev = d[0].signum();
+    // The case split below is Skia's
+    // GrPathUtils::chopCubicAtLoopIntersection verbatim ({1,-1,1} and its
+    // shorter forms): that *relative* pattern is direction-invariant and
+    // correct, and it is the part worth copying.
+    //
+    // The overall sign is where we deliberately part company. Skia leaves
+    // it entirely to whatever `set_loop_klm` happened to produce, with no
+    // global correction. Measured by running Skia's exact constants through
+    // this port's tests, that inverts the fill (paints the loop's exterior)
+    // on every d0 > 0 loop -- `loop_piece_fill_matches_true_interior` fails
+    // 900/900 samples -- and is not reversal-invariant. Skia gets away with
+    // it because its only caller is gm/beziereffects.cpp, a visual GM that
+    // draws each chopped piece as a standalone quad and never asserts which
+    // side came out filled. We render for real, so the loop piece must
+    // paint its own enclosed interior; with the direction canonicalized to
+    // d0 > 0 above, that pins the loop piece at +1 and the tails at -1.
+    let (loop_sign, tail_sign) = (1.0f32, -1.0f32);
     let klm_rev: Vec<f32> = match chop_ts.len() {
-        2 => vec![1.0, rev, 1.0],
+        2 => vec![tail_sign, loop_sign, tail_sign],
         1 => {
-            if small_s < 0.0 { vec![rev, 1.0] } else { vec![1.0, rev] }
+            if small_s < 0.0 {
+                vec![loop_sign, tail_sign]
+            } else {
+                vec![tail_sign, loop_sign]
+            }
         }
         _ => {
-            if small_s < 0.0 && large_s > 1.0 { vec![rev] } else { vec![1.0] }
+            if small_s < 0.0 && large_s > 1.0 { vec![loop_sign] } else { vec![tail_sign] }
         }
     };
 
@@ -1136,6 +1171,143 @@ mod tests {
             total - agree,
             total
         );
+    }
+
+    /// Reversing a cubic's control points traces the identical curve, so it
+    /// must produce the identical filled region. It did not: `klm_rev` used
+    /// to derive the loop-vs-tail flip from `d[0].signum()`, and d0 changes
+    /// sign under t -> 1-t, so the flip was applied for one traversal
+    /// direction and skipped for the other. The visible symptom was a
+    /// near-cusp loop rendering as two triangles meeting at the double
+    /// point, one filled on each side of the arc, that collapsed into a
+    /// single region when the endpoints were dragged in the opposite order.
+    #[test]
+    fn loop_fill_is_invariant_under_reversal() {
+        // Shaded region of a whole curve: the union over its chopped pieces
+        // of {f < 0} clipped to that piece's coverage mesh, i.e. exactly
+        // what the renderer paints.
+        fn shaded_set(p: &[Pt; 4]) -> Vec<(Vec<Pt>, ImplicitCubic)> {
+            chop_at_loop_intersection(p)
+                .into_iter()
+                .filter(|pc| pc.implicit.is_renderable())
+                .map(|pc| {
+                    let mesh = crate::geometry::coverage_mesh(&pc.points, &pc.implicit, 1.5);
+                    (mesh.iter().map(|v| v.pos).collect::<Vec<Pt>>(), pc.implicit)
+                })
+                .collect()
+        }
+        fn is_shaded(set: &[(Vec<Pt>, ImplicitCubic)], q: Pt) -> bool {
+            set.iter().any(|(poly, imp)| {
+                poly.len() >= 3 && point_in_convex_polygon(q, poly) && {
+                    let klm = imp.eval_klm(q);
+                    klm[0].powi(3) - klm[1] * klm[2] < 0.0
+                }
+            })
+        }
+
+        let mut cases: Vec<(String, [Pt; 4])> = preset_curves()
+            .into_iter()
+            .filter(|(_, kind, _)| *kind == CubicKind::Loop)
+            .map(|(name, _, p)| (name.to_string(), p))
+            .collect();
+        // The near-cusp loop from the reported screenshot: its double point
+        // falls at t = 0.417 while its partner root is at t = 2.197, so the
+        // arc crosses the node without ever closing the loop.
+        cases.push((
+            "reported near-cusp loop".to_string(),
+            [[963.0, 620.0], [720.0, 213.0], [410.0, 431.0], [245.0, 652.0]],
+        ));
+
+        for (name, p) in cases {
+            let rev = [p[3], p[2], p[1], p[0]];
+            let (fwd_set, rev_set) = (shaded_set(&p), shaded_set(&rev));
+
+            let (mut mnx, mut mny, mut mxx, mut mxy) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+            for q in p.iter() {
+                mnx = mnx.min(q[0]);
+                mny = mny.min(q[1]);
+                mxx = mxx.max(q[0]);
+                mxy = mxy.max(q[1]);
+            }
+
+            let n = 80;
+            let (mut differ, mut total) = (0, 0);
+            for gy in 0..n {
+                for gx in 0..n {
+                    let q = [
+                        mnx + (mxx - mnx) * gx as f32 / (n - 1) as f32,
+                        mny + (mxy - mny) * gy as f32 / (n - 1) as f32,
+                    ];
+                    total += 1;
+                    if is_shaded(&fwd_set, q) != is_shaded(&rev_set, q) {
+                        differ += 1;
+                    }
+                }
+            }
+            // Samples landing on the boundary can fall either way on float
+            // noise; a whole mis-signed piece is orders of magnitude larger.
+            assert!(
+                differ * 100 <= total,
+                "{name}: fill differs on {differ}/{total} samples when the \
+                 control points are reversed"
+            );
+        }
+    }
+
+    /// The reported symptom, stated directly: the filled region must stay on
+    /// the same side of the arc across a chop. It did not for a near-cusp
+    /// loop -- the two pieces met at the double point with one filled above
+    /// the curve and the other below, reading as two triangles joined at a
+    /// point.
+    #[test]
+    fn loop_fill_stays_on_one_side_across_chops() {
+        let mut cases: Vec<(String, [Pt; 4])> = preset_curves()
+            .into_iter()
+            .filter(|(_, kind, _)| *kind == CubicKind::Loop)
+            .map(|(name, _, p)| (name.to_string(), p))
+            .collect();
+        cases.push((
+            "reported near-cusp loop".to_string(),
+            [[963.0, 620.0], [720.0, 213.0], [410.0, 431.0], [245.0, 652.0]],
+        ));
+
+        for (name, p) in cases {
+            let pieces = chop_at_loop_intersection(&p);
+            let mut sides: Vec<(usize, char)> = Vec::new();
+            for (i, piece) in pieces.iter().enumerate() {
+                for j in 1..=9 {
+                    let t = j as f32 / 10.0;
+                    let e = eval(&piece.points, t);
+                    let e2 = eval(&piece.points, t + 1e-3);
+                    let (tx, ty) = (e2[0] - e[0], e2[1] - e[1]);
+                    let n = (tx * tx + ty * ty).sqrt();
+                    if n < 1e-6 {
+                        continue;
+                    }
+                    // Probe symmetrically about the arc, along its normal.
+                    let (nx, ny) = (-ty / n * 2.0, tx / n * 2.0);
+                    let f = |q: Pt| {
+                        let klm = piece.implicit.eval_klm(q);
+                        klm[0].powi(3) - klm[1] * klm[2]
+                    };
+                    let left = f([e[0] - nx, e[1] - ny]) < 0.0;
+                    let right = f([e[0] + nx, e[1] + ny]) < 0.0;
+                    // Only samples that cleanly straddle the boundary say
+                    // anything about orientation.
+                    if left != right {
+                        sides.push((i, if left { 'L' } else { 'R' }));
+                    }
+                }
+            }
+            let first = match sides.first() {
+                Some(&(_, c)) => c,
+                None => continue,
+            };
+            assert!(
+                sides.iter().all(|&(_, c)| c == first),
+                "{name}: filled side flips between pieces: {sides:?}"
+            );
+        }
     }
 
     fn point_in_polygon(pt: Pt, poly: &[Pt]) -> bool {
